@@ -1525,8 +1525,12 @@ tensorflow::Status BinaryTensorOpTensor(OpConverterParams* params,
   nvinfer1::DataType dtype = attrs.get<nvinfer1::DataType>("T");
 
   // check type consistency
-  TFTRT_CHECK_EQ_TYPE(tensor_l->getType(), dtype);
-  TFTRT_CHECK_EQ_TYPE(tensor_r->getType(), dtype);
+  if (tensor_l->getType() != dtype || tensor_r->getType() != dtype) {
+    return tensorflow::errors::InvalidArgument(
+        "Operands for BinaryOp ", node_def.op(), " have different types (",
+        std::to_string((int)tensor_l->getType()), " != ",
+        std::to_string((int)tensor_r->getType()), "), at ", node_def.name());
+  }
   auto op_pair = ops.find(node_def.op());
   if (op_pair == ops.end()) {
     return tensorflow::errors::Unimplemented(
@@ -1722,6 +1726,219 @@ tensorflow::Status ConvertReshape(OpConverterParams* params) {
   return tensorflow::Status::OK();
 }
 
+tensorflow::Status ConvertSqueeze(OpConverterParams* params) {
+  const auto& inputs = params->inputs;
+  const auto& node_def = params->node_def;
+  if (inputs.size() != 1) {
+    return tensorflow::errors::InvalidArgument(
+        "One input expected for Squeeze, at ", node_def.name());
+  }
+  if (inputs.at(0).is_weights()) {
+    return tensorflow::errors::Unimplemented(
+        "Squeeze is only implemented for tensor inputs, at ", node_def.name());
+  }
+  TFAttrs attrs(node_def);
+  if (attrs.count("squeeze_dims") == 0) {
+    return tensorflow::errors::Unimplemented(
+        "Squeeze is only implemented for explicit dims, at ", node_def.name());
+  }
+  // Get input shape
+  TRT_TensorOrWeights input_tensor = inputs.at(0);
+  nvinfer1::Dims input_dims = input_tensor.tensor()->getDimensions();
+  // Mark axes to remove by setting them to 0
+  auto squeeze_dims = attrs.get<std::vector<int>>("squeeze_dims");
+  for (int axis : squeeze_dims) {
+    if (axis < 0) axis += input_dims.nbDims + 1;
+    // Subtract 1 for batch dim
+    axis -= 1;
+    // Make sure target dimension is size 1
+    if (input_dims.d[axis] != 1) {
+      return tensorflow::errors::InvalidArgument(
+          "Cannot squeeze a dimension which isn't size 1, at", node_def.name());
+    }
+    // Mark dim for removal
+    input_dims.d[axis] = 0;
+  }
+
+  if (params->validation_only) return Status::OK();
+  
+  // Build new shape by only including non-zero sizes
+  nvinfer1::Dims new_dims;
+  new_dims.nbDims = 0;
+  for (int i = 0;  i < input_dims.nbDims; i++) {
+    if (input_dims.d[i] != 0) {
+      new_dims.d[new_dims.nbDims++] = input_dims.d[i];
+    }
+  }
+  // Reshape tensor
+  const nvinfer1::ITensor* output_tensor = nullptr;
+  TF_RETURN_IF_ERROR(params->converter->PrepareTensorForShape(
+      input_tensor, new_dims, &output_tensor));
+  params->outputs->push_back(
+      TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(output_tensor)));
+  return tensorflow::Status::OK();
+}
+
+tensorflow::Status ConvertExpandDims(OpConverterParams* params) {
+  const auto& inputs = params->inputs;
+  const auto& node_def = params->node_def;
+  if (inputs.size() != 2) {
+    return tensorflow::errors::InvalidArgument(
+        "Two inputs expected for ExpandDims, at ", node_def.name());
+  }
+  if (!inputs.at(0).is_tensor() ) {
+    return tensorflow::errors::Unimplemented(
+        "ExpandDims is only implemented for tensor inputs, at ", 
+        node_def.name());
+  }
+  if (!inputs.at(1).is_weights() ) {
+    return tensorflow::errors::Unimplemented(
+        "ExpandDims expects weights for axis, at ", node_def.name());
+  }
+  if (params->validation_only) return Status::OK();
+
+  // Get input shape as vector
+  TRT_TensorOrWeights input_tensor = inputs.at(0);
+  const nvinfer1::Dims dims = input_tensor.tensor()->getDimensions();
+  std::vector<int> input_dims(dims.nbDims);
+  for (int i = 0; i < dims.nbDims; i++) {
+    input_dims[i] = dims.d[i];
+  }
+  // Get axes as vector
+  TRT_ShapedWeights weights = inputs.at(1).weights();
+  const int* weights_ptr =
+      static_cast<int*>(const_cast<void*>(weights.GetValues()));
+  std::vector<int> axes(weights_ptr, weights_ptr + weights.count());
+
+  // Sort axes descending
+  std::sort(axes.begin(), axes.end(), std::greater<int>()); 
+  // Add new axes to input shape vector
+  for (int axis : axes) {
+    if (axis < 0) axis += dims.nbDims + 1;
+    // Subtract 1 for batch dim
+    axis -= 1;
+    // Insert dim of size 1
+    input_dims.insert(input_dims.begin()+axis, 1);
+  }
+  // Convert input_dims vector into nvinfer1::Dims
+  nvinfer1::Dims new_dims;
+  new_dims.nbDims = input_dims.size();
+  for(int i = 0; i < input_dims.size(); i++) {
+    new_dims.d[i] = input_dims[i];
+  }
+  // Reshape tensor
+  const nvinfer1::ITensor* output_tensor = nullptr;
+  TF_RETURN_IF_ERROR(params->converter->PrepareTensorForShape(
+      input_tensor, new_dims, &output_tensor));
+  params->outputs->push_back(
+      TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(output_tensor)));
+  return tensorflow::Status::OK();
+}
+
+tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
+  const auto& inputs = params->inputs;
+  const auto& node_def = params->node_def;
+  if (inputs.size() != 4) {
+    return tensorflow::errors::InvalidArgument(
+        "StridedSlice expects 4 inputs, at ", node_def.name());
+  }
+  if (!inputs.at(0).is_tensor() ) {
+    return tensorflow::errors::Unimplemented(
+        "StridedSlice is only implemented for tensor inputs, at ", 
+        node_def.name());
+  }
+  if (!inputs.at(1).is_weights() ||
+      !inputs.at(2).is_weights() ||
+      !inputs.at(3).is_weights()) {
+    return tensorflow::errors::InvalidArgument(
+        "StridedSlice expects weights for begin, end, and strides, at ",
+        node_def.name());
+  }
+
+  // Begin
+  TRT_ShapedWeights begin_weights = inputs.at(1).weights();
+  const int* begin_weights_ptr =
+      static_cast<int*>(const_cast<void*>(begin_weights.GetValues()));
+  std::vector<int> begin_offset(begin_weights_ptr, begin_weights_ptr + begin_weights.count());
+  // End
+  TRT_ShapedWeights end_weights = inputs.at(2).weights();
+  const int* end_weights_ptr =
+      static_cast<int*>(const_cast<void*>(end_weights.GetValues()));
+  std::vector<int> end_offset(end_weights_ptr, end_weights_ptr + end_weights.count());
+  // Strides
+  TRT_ShapedWeights stride_weights = inputs.at(3).weights();
+  const int* stride_weights_ptr =
+      static_cast<int*>(const_cast<void*>(stride_weights.GetValues()));
+  std::vector<int> strides(stride_weights_ptr, stride_weights_ptr + stride_weights.count());
+  for (int x : strides) {
+    if (x != 1) {
+      return tensorflow::errors::Unimplemented(
+        "StridedSlice is only implemented for stride of 1, at ", 
+        node_def.name());
+    }
+  }
+  TFAttrs attrs(node_def);
+  // Apply optional argument masks
+  if (attrs.count("begin_mask") != 0) {
+    int begin_mask = attrs.get<int>("begin_mask");
+    for (int i = 0; i < begin_offset.size(); i++) {
+      const bool mask_bit_set = ((1 << i) & begin_mask);
+      if (mask_bit_set) {
+        begin_offset[i] = 0;
+      }
+    }
+  }
+  if (attrs.count("end_mask") != 0) {
+    int end_mask = attrs.get<int>("end_mask");
+    for (int i = 0; i < end_offset.size(); i++) {
+      const bool mask_bit_set = ((1 << i) & end_mask);
+      if (mask_bit_set) {
+        // we should built the padding thing here maybe
+        // if bit is set the padding is 0
+        end_offset[i] = tensor_shape.d[i]; // TODO account for batch dim
+      }
+    }
+  }
+  if (attrs.count("ellipsis_mask") != 0) {
+    int ellipsis_mask = attrs.get<int>("ellipsis_mask");
+    if (ellipsis_mask != 0) {
+      return tensorflow::errors::Unimplemented(
+        "ellipsis_mask is not implemented for StridedSlice, at ", 
+        node_def.name());
+    }
+  }
+  if (attrs.count("new_axis_mask") != 0) {
+    int new_axis_mask = attrs.get<int>("new_axis_mask");
+    if (new_axis_mask != 0) {
+      return tensorflow::errors::Unimplemented(
+        "new_axis_mask is not implemented for StridedSlice, at ", 
+        node_def.name());
+    }
+  }
+  if (attrs.count("shrink_axis_mask") != 0) {
+    int shrink_axis_mask = attrs.get<int>("shrink_axis_mask");
+    if (shrink_axis_mask != 0) {
+      return tensorflow::errors::Unimplemented(
+        "shrink_axis_mask is not implemented for StridedSlice, at ", 
+        node_def.name());
+    }
+  }
+  // Remove batch dimensions and make sure they are not modified
+  // Limitations of padding layer
+  // has to be 2 inner dims
+
+  if (params->validation_only) return Status::OK();
+
+  // Convert to pre/post padding values
+
+  const nvinfer1::ITensor* output_tensor = nullptr;
+  //TF_RETURN_IF_ERROR(params->converter->PrepareTensorForShape(
+  //    input_tensor, new_dims, &output_tensor));
+  params->outputs->push_back(
+      TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(output_tensor)));
+  return tensorflow::Status::OK();
+}
+
 tensorflow::Status ConvertConv2D(OpConverterParams* params) {
   return ConvertConv2DHelper(params, ConvolutionType::DEFAULT);
 }
@@ -1812,12 +2029,25 @@ tensorflow::Status ConvertPool(OpConverterParams* params) {
 }
 
 tensorflow::Status ConvertActivation(OpConverterParams* params) {
-  const nvinfer1::ITensor* tensor = params->inputs.at(0).tensor();
+  const auto& inputs = params->inputs;
+  const auto& node_def = params->node_def;
+  static const std::unordered_map<string, nvinfer1::ActivationType> ops{
+      {"Relu", nvinfer1::ActivationType::kRELU},
+      {"Sigmoid", nvinfer1::ActivationType::kSIGMOID},
+      {"Tanh", nvinfer1::ActivationType::kTANH},
+  };
+  auto op_pair = ops.find(node_def.op());
+  if (op_pair == ops.end()) {
+    return tensorflow::errors::Unimplemented(
+        "Activation op: ", node_def.op(), " not supported at: ",
+        node_def.name());
+  }
+  const nvinfer1::ITensor* tensor = inputs.at(0).tensor();
   nvinfer1::IActivationLayer* layer =
       params->converter->network()->addActivation(
           *const_cast<nvinfer1::ITensor*>(tensor),
-          nvinfer1::ActivationType::kRELU);
-  TFTRT_RETURN_ERROR_IF_NULLPTR(layer, params->node_def.name());
+          op_pair->second);
+  TFTRT_RETURN_ERROR_IF_NULLPTR(layer, node_def.name());
   nvinfer1::ITensor* output_tensor = layer->getOutput(0);
   params->outputs->push_back(TRT_TensorOrWeights(output_tensor));
   return tensorflow::Status::OK();
@@ -2737,6 +2967,9 @@ void TrtNodeValidator::RegisterOpValidators() {
   op_validators_["Transpose"] = ConvertTranspose;
   op_validators_["Reshape"] = ConvertReshape;
   op_validators_["MatMul"] = ConvertMatMul;
+  op_validators_["Squeeze"] = ConvertSqueeze;
+  op_validators_["ExpandDims"] = ConvertExpandDims;
+  //op_validators_["StridedSlice"] = StridedSlice;
 }
 
 void Converter::RegisterOpConverters() {
@@ -2744,6 +2977,8 @@ void Converter::RegisterOpConverters() {
   op_registry_["Conv2D"] = ConvertConv2D;
   op_registry_["DepthwiseConv2dNative"] = ConvertConv2DDepthwise;
   op_registry_["Relu"] = ConvertActivation;
+  op_registry_["Sigmoid"] = ConvertActivation;
+  op_registry_["Tanh"] = ConvertActivation;
   op_registry_["MaxPool"] = ConvertPool;
   op_registry_["AvgPool"] = ConvertPool;
   op_registry_["BiasAdd"] = ConvertScale;
@@ -2787,6 +3022,9 @@ void Converter::RegisterOpConverters() {
   op_registry_["MatMul"] = ConvertMatMul;
   op_registry_["BatchMatMul"] = ConvertBatchMatMul;
   op_registry_["TopKV2"] = ConvertTopK;
+  op_registry_["Squeeze"] = ConvertSqueeze;
+  op_registry_["ExpandDims"] = ConvertExpandDims;
+  //op_registry_["StridedSlice"] = StridedSlice;
 
   plugin_converter_ = ConvertPlugin;
 }

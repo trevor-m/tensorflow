@@ -64,6 +64,7 @@ void* GetTensorAddress(const Tensor* tensor_ptr) {
     TYPECASE(tensorflow::DT_FLOAT, tensor_ptr, dest_ptr);
     TYPECASE(tensorflow::DT_HALF, tensor_ptr, dest_ptr);
     TYPECASE(tensorflow::DT_INT8, tensor_ptr, dest_ptr);
+    TYPECASE(tensorflow::DT_INT32, tensor_ptr, dest_ptr);
     default: {
       LOG(ERROR) << "Unsupported Data type "
                  << tensorflow::DataTypeString(tensor_type);
@@ -237,7 +238,7 @@ void TRTEngineOp::ExecuteCalibration(OpKernelContext* ctx,
 }
 
 int TRTEngineOp::GetEngineBatch(OpKernelContext* ctx) {
-  int num_batch = ctx->input(0).shape().dim_size(0);
+  int num_batch = (ctx->num_inputs() > 0) ? ctx->input(0).shape().dim_size(0) : 1;
   int smallest_engine = 0;
   for (const auto i : cached_engine_batches_) {
     if (i >= num_batch) {
@@ -280,7 +281,7 @@ void TRTEngineOp::ComputeAsync(OpKernelContext* ctx,
     return;
   }
 
-  const int num_batch = ctx->input(0).shape().dim_size(0);
+  const int num_batch = (ctx->num_inputs() > 0) ? ctx->input(0).shape().dim_size(0) : 1;
   auto& engine_ctx_pair = GetEngine(smallest_engine, ctx);
   auto& trt_engine_ptr = engine_ctx_pair.first;
   if (!trt_engine_ptr) {
