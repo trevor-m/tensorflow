@@ -1973,7 +1973,7 @@ tensorflow::Status ConvertShape(OpConverterParams* params) {
     dst[i] = dims.d[i];
   }
 
-  outputs->push_back(TRT_TensorOrWeights(weights));
+  params->outputs->push_back(TRT_TensorOrWeights(weights));
   return tensorflow::Status::OK();
 }
 
@@ -3062,8 +3062,9 @@ void Converter::RegisterOpConverters() {
   op_registry_["TopKV2"] = ConvertTopK;
   op_registry_["Squeeze"] = ConvertSqueeze;
   op_registry_["ExpandDims"] = ConvertExpandDims;
-  op_registry_["Shape"] = StridedShape;
+  op_registry_["Shape"] = ConvertShape;
   //op_registry_["StridedSlice"] = StridedSlice;
+  // TODO(tmorris): ConvertPack
 
   plugin_converter_ = ConvertPlugin;
 }
