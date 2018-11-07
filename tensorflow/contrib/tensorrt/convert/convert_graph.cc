@@ -132,6 +132,7 @@ Status TrtCandidateSelector::IsTensorRTCandidate(const tensorflow::Node* node) {
     "ExpandDims",
     //"StridedSlice",
     "Sigmoid",
+    "Shape",
   };
   // LINT.ThenChange(//tensorflow/contrib/tensorrt/convert/convert_nodes.cc)
   const bool is_supported_op_type =

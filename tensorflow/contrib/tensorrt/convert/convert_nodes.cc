@@ -1795,31 +1795,33 @@ tensorflow::Status ConvertExpandDims(OpConverterParams* params) {
     return tensorflow::errors::Unimplemented(
         "ExpandDims expects weights for axis, at ", node_def.name());
   }
-  if (params->validation_only) return Status::OK();
 
   // Get input shape as vector
   TRT_TensorOrWeights input_tensor = inputs.at(0);
-  const nvinfer1::Dims dims = input_tensor.tensor()->getDimensions();
-  std::vector<int> input_dims(dims.nbDims);
-  for (int i = 0; i < dims.nbDims; i++) {
-    input_dims[i] = dims.d[i];
-  }
+  const nvinfer1::Dims dims = input_tensor.GetTrtDims();
+  std::vector<int> input_dims(dims.d, dims.d + dims.nbDims);
   // Get axes as vector
   TRT_ShapedWeights weights = inputs.at(1).weights();
   const int* weights_ptr =
       static_cast<int*>(const_cast<void*>(weights.GetValues()));
   std::vector<int> axes(weights_ptr, weights_ptr + weights.count());
-
   // Sort axes descending
   std::sort(axes.begin(), axes.end(), std::greater<int>()); 
   // Add new axes to input shape vector
   for (int axis : axes) {
-    if (axis < 0) axis += dims.nbDims + 1;
+    if (axis < 0) axis += input_dims.size() + 1;
     // Subtract 1 for batch dim
     axis -= 1;
+    if (axis <= 0) {
+      return tensorflow::errors::Unimplemented(
+          "Modifying batch dimension is not supported for ExpandDims, at ",
+          node_def.name());
+    }
     // Insert dim of size 1
     input_dims.insert(input_dims.begin()+axis, 1);
   }
+  if (params->validation_only) return Status::OK();
+
   // Convert input_dims vector into nvinfer1::Dims
   nvinfer1::Dims new_dims;
   new_dims.nbDims = input_dims.size();
@@ -1895,7 +1897,7 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
       if (mask_bit_set) {
         // we should built the padding thing here maybe
         // if bit is set the padding is 0
-        end_offset[i] = tensor_shape.d[i]; // TODO account for batch dim
+        //end_offset[i] = tensor_shape.d[i]; // TODO account for batch dim
       }
     }
   }
@@ -1936,6 +1938,42 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
   //    input_tensor, new_dims, &output_tensor));
   params->outputs->push_back(
       TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(output_tensor)));
+  return tensorflow::Status::OK();
+}
+
+tensorflow::Status ConvertShape(OpConverterParams* params) {
+  const auto& inputs = params->inputs;
+  const auto& node_def = params->node_def;
+  if (inputs.size() != 1) {
+    return tensorflow::errors::InvalidArgument(
+        "Shape op expects 1 input, at ", node_def.name());
+  }
+
+  nvinfer1::Dims dims = inputs.at(0).GetTrtDims();
+  // Shape op will expect batch at dim 0, so we need to add it back
+  dims.nbDims++;
+  for (int i = dims.nbDims; i > 0; i--) {
+    dims.d[i] = dims.d[i-1];
+  }
+  dims.d[0] = -1; //GetMaxBatchSize(); // or should we put -1?
+
+  // TODO(tmorris): should we warn for any dynamic non-batch dims? shapes should
+  // be defined by this point.
+
+  // Create weights
+  nvinfer1::Dims shape_dims;
+  shape_dims.nbDims = 1;
+  shape_dims.d[0] = dims.nbDims;
+  TRT_ShapedWeights weights = params->weight_store->GetTempWeights(
+      tensorflow::DataType::DT_INT32, shape_dims);
+
+  // Set value of weight to shape of input tensor
+  int* dst = const_cast<int*>(static_cast<int const*>(weights.GetValues()));
+  for (int i = 0; i < dims.nbDims; i++) {
+    dst[i] = dims.d[i];
+  }
+
+  outputs->push_back(TRT_TensorOrWeights(weights));
   return tensorflow::Status::OK();
 }
 
@@ -3024,6 +3062,7 @@ void Converter::RegisterOpConverters() {
   op_registry_["TopKV2"] = ConvertTopK;
   op_registry_["Squeeze"] = ConvertSqueeze;
   op_registry_["ExpandDims"] = ConvertExpandDims;
+  op_registry_["Shape"] = StridedShape;
   //op_registry_["StridedSlice"] = StridedSlice;
 
   plugin_converter_ = ConvertPlugin;
