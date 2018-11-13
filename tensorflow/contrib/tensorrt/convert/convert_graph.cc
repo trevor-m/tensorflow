@@ -130,9 +130,12 @@ Status TrtCandidateSelector::IsTensorRTCandidate(const tensorflow::Node* node) {
     "Min",
     "Squeeze",
     "ExpandDims",
-    //"StridedSlice",
+    "StridedSlice",
     "Sigmoid",
+    "Tanh",
     "Shape",
+    "Pack",
+    "Square",
   };
   // LINT.ThenChange(//tensorflow/contrib/tensorrt/convert/convert_nodes.cc)
   const bool is_supported_op_type =

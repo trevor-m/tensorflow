@@ -577,6 +577,11 @@ bool TFAttrs::get<bool>(const string& key) const {
   return this->at(key)->b();
 }
 
+template <>
+int64_t TFAttrs::get<int64_t>(const string& key) const {
+  return this->at(key)->i();
+}
+
 // TODO(jie): reorder4 & reorder2 should be merged?
 // TODO(aaroey): fix the order of parameters.
 template <typename T>
@@ -1844,11 +1849,6 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
     return tensorflow::errors::InvalidArgument(
         "StridedSlice expects 4 inputs, at ", node_def.name());
   }
-  if (!inputs.at(0).is_tensor() ) {
-    return tensorflow::errors::Unimplemented(
-        "StridedSlice is only implemented for tensor inputs, at ", 
-        node_def.name());
-  }
   if (!inputs.at(1).is_weights() ||
       !inputs.at(2).is_weights() ||
       !inputs.at(3).is_weights()) {
@@ -1857,16 +1857,52 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
         node_def.name());
   }
 
+  // Input dims
+  nvinfer1::Dims dims = inputs.at(0).GetTrtDims();
+  std::vector<int> input_dims(dims.d, dims.d + dims.nbDims);
+  if (inputs.at(0).is_tensor()) {
+    // Temporarily add batch dimension so that indexes line up properly.
+    input_dims.insert(input_dims.begin(), -1);
+  }
+
   // Begin
   TRT_ShapedWeights begin_weights = inputs.at(1).weights();
   const int* begin_weights_ptr =
       static_cast<int*>(const_cast<void*>(begin_weights.GetValues()));
-  std::vector<int> begin_offset(begin_weights_ptr, begin_weights_ptr + begin_weights.count());
+  std::vector<int> begin(begin_weights_ptr, begin_weights_ptr + begin_weights.count());
+  if (begin.size() != input_dims.size()) {
+    return tensorflow::errors::InvalidArgument(
+        "StridedSlice \"begin\" specified ", std::to_string(begin.size()),
+        " dimensions, but input rank is ", std::to_string(input_dims.size()),
+        ", at ", node_def.name());
+  }
+  // Handle negative values
+  LOG(INFO) << "begin: ";
+  for (int i = 0; i < begin.size(); i++) {
+    if (begin[i] < 0) {
+      begin[i] = (input_dims[i] - 1) - begin[i];
+    }
+    LOG(INFO) << begin[i];
+  }
   // End
   TRT_ShapedWeights end_weights = inputs.at(2).weights();
   const int* end_weights_ptr =
       static_cast<int*>(const_cast<void*>(end_weights.GetValues()));
-  std::vector<int> end_offset(end_weights_ptr, end_weights_ptr + end_weights.count());
+  std::vector<int> end(end_weights_ptr, end_weights_ptr + end_weights.count());
+  if (end.size() != input_dims.size()) {
+    return tensorflow::errors::InvalidArgument(
+        "StridedSlice \"end\" specified ", std::to_string(end.size()),
+        " dimensions, but input rank is ", std::to_string(input_dims.size()),
+        ", at ", node_def.name());
+  }
+  // Handle negative values
+  LOG(INFO) << "end: ";
+  for (int i = 0; i < end.size(); i++) {
+    if (end[i] < 0) {
+      end[i] = (input_dims[i] - 1) - end[i];
+    }
+    LOG(INFO) << end[i];
+  }
   // Strides
   TRT_ShapedWeights stride_weights = inputs.at(3).weights();
   const int* stride_weights_ptr =
@@ -1882,27 +1918,28 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
   TFAttrs attrs(node_def);
   // Apply optional argument masks
   if (attrs.count("begin_mask") != 0) {
-    int begin_mask = attrs.get<int>("begin_mask");
-    for (int i = 0; i < begin_offset.size(); i++) {
+    int begin_mask = attrs.get<int64_t>("begin_mask");
+    LOG(INFO) << "begin_mask: " << begin_mask;
+    for (int i = 0; i < begin.size(); i++) {
       const bool mask_bit_set = ((1 << i) & begin_mask);
       if (mask_bit_set) {
-        begin_offset[i] = 0;
+        begin[i] = 0;
       }
     }
   }
   if (attrs.count("end_mask") != 0) {
-    int end_mask = attrs.get<int>("end_mask");
-    for (int i = 0; i < end_offset.size(); i++) {
+    int end_mask = attrs.get<int64_t>("end_mask");
+    LOG(INFO) << "end_mask: " << end_mask;
+    for (int i = 0; i < end.size(); i++) {
       const bool mask_bit_set = ((1 << i) & end_mask);
       if (mask_bit_set) {
-        // we should built the padding thing here maybe
-        // if bit is set the padding is 0
-        //end_offset[i] = tensor_shape.d[i]; // TODO account for batch dim
+        end[i] = input_dims[i];
       }
     }
   }
   if (attrs.count("ellipsis_mask") != 0) {
-    int ellipsis_mask = attrs.get<int>("ellipsis_mask");
+    int ellipsis_mask = attrs.get<int64_t>("ellipsis_mask");
+    LOG(INFO) << "ellipsis_mask: " << ellipsis_mask;
     if (ellipsis_mask != 0) {
       return tensorflow::errors::Unimplemented(
         "ellipsis_mask is not implemented for StridedSlice, at ", 
@@ -1910,7 +1947,8 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
     }
   }
   if (attrs.count("new_axis_mask") != 0) {
-    int new_axis_mask = attrs.get<int>("new_axis_mask");
+    int new_axis_mask = attrs.get<int64_t>("new_axis_mask");
+    LOG(INFO) << "new_axis_mask: " << new_axis_mask;
     if (new_axis_mask != 0) {
       return tensorflow::errors::Unimplemented(
         "new_axis_mask is not implemented for StridedSlice, at ", 
@@ -1918,26 +1956,95 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
     }
   }
   if (attrs.count("shrink_axis_mask") != 0) {
-    int shrink_axis_mask = attrs.get<int>("shrink_axis_mask");
+    int shrink_axis_mask = attrs.get<int64_t>("shrink_axis_mask");
+    LOG(INFO) << "shrink_axis_mask: " << shrink_axis_mask;
     if (shrink_axis_mask != 0) {
       return tensorflow::errors::Unimplemented(
         "shrink_axis_mask is not implemented for StridedSlice, at ", 
         node_def.name());
     }
   }
-  // Remove batch dimensions and make sure they are not modified
-  // Limitations of padding layer
-  // has to be 2 inner dims
+  // TODO(tmorris): check bounds
+  // TODO(tmorris): check for attempted modification of batch dim (for tensors)
+  if (inputs.at(0).is_weights()) {
+    // TODO(tmorris): This is temporary
+    return tensorflow::errors::Unimplemented(
+        "StridedSlice is not implemented for weight inputs, at ", 
+        node_def.name());
+  }
+  else if (inputs.at(0).is_tensor() ) {
+    // Make sure shape is 4D
+    if (input_dims.size() != 4) {
+      return tensorflow::errors::Unimplemented(
+        "StridedSlice requires NCHW inputs for tensors, at ", 
+        node_def.name());
+    }
+    if (params->validation_only) return Status::OK();
+    // TODO(tmorris): find which two dims are changing and designate those as HW, transpose tensor to match
+    // Start conversion.
+    // Convert to pre/post padding values
+    nvinfer1::DimsHW pre_padding;
+    pre_padding.d[0] = -begin[2];
+    pre_padding.d[1] = -begin[3];
+    nvinfer1::DimsHW post_padding;
+    post_padding.d[0] = end[2] - input_dims[2];
+    post_padding.d[1] = end[3] - input_dims[3];
 
-  if (params->validation_only) return Status::OK();
+    LOG(INFO) << "input_dims: " << DebugString(dims);
+    LOG(INFO) << "pre_padding: " << DebugString(pre_padding);
+    LOG(INFO) << "post_padding: " << DebugString(post_padding);
+    //LOG(INFO) << "data_format: " << attrs.get<string>("data_format");
 
-  // Convert to pre/post padding values
+    const nvinfer1::ITensor* tensor = inputs.at(0).tensor();
+    nvinfer1::IPaddingLayer* layer = params->converter->network()->addPadding(
+        *const_cast<nvinfer1::ITensor*>(tensor), pre_padding, post_padding);
+    TFTRT_RETURN_ERROR_IF_NULLPTR(layer, node_def.name());
+    const nvinfer1::ITensor* output_tensor = layer->getOutput(0);
+    params->outputs->push_back(
+        TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(output_tensor)));
+  }
+  return tensorflow::Status::OK();
+}
 
-  const nvinfer1::ITensor* output_tensor = nullptr;
-  //TF_RETURN_IF_ERROR(params->converter->PrepareTensorForShape(
-  //    input_tensor, new_dims, &output_tensor));
-  params->outputs->push_back(
-      TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(output_tensor)));
+tensorflow::Status ConvertPack(OpConverterParams* params) {
+  const auto& inputs = params->inputs;
+  const auto& node_def = params->node_def;
+
+  TFAttrs attrs(node_def);
+  //auto type = attrs.get<tensorflow::DataType>("T");
+  int64_t axis = 0;
+  if (attrs.count("axis")) {
+    axis = attrs.get<int64_t>("axis");
+  }
+
+  // Gather all inputs
+  std::vector<int> output;
+  for (int i = 0; i < inputs.size(); i++) {
+    if (inputs.at(0).is_tensor()) {
+      return tensorflow::errors::Unimplemented(
+          "Pack is only implemented for weights, at ", node_def.name());
+    }
+    TRT_ShapedWeights weights = inputs.at(i).weights();
+    if (weights.count() != 1) {
+      return tensorflow::errors::Unimplemented(
+          "Pack is only implemented for scalar inputs, at ", node_def.name());
+    }
+    const int* weights_ptr =
+      static_cast<int*>(const_cast<void*>(weights.GetValues()));
+    output.push_back(weights_ptr[0]);
+  }
+
+  // Build weight to store output
+  nvinfer1::Dims dims;
+  dims.nbDims = 1;
+  dims.d[0] = output.size();
+  TRT_ShapedWeights weights = params->weight_store->GetTempWeights(
+      tensorflow::DataType::DT_INT32, dims);
+  // Set value of weight to shape of input tensor
+  int* dst = const_cast<int*>(static_cast<int const*>(weights.GetValues()));
+  std::copy(output.begin(), output.end(), dst);
+
+  params->outputs->push_back(TRT_TensorOrWeights(weights));
   return tensorflow::Status::OK();
 }
 
@@ -1950,30 +2057,60 @@ tensorflow::Status ConvertShape(OpConverterParams* params) {
   }
 
   nvinfer1::Dims dims = inputs.at(0).GetTrtDims();
+  std::vector<int> input_dims(dims.d, dims.d + dims.nbDims);
   // Shape op will expect batch at dim 0, so we need to add it back
-  dims.nbDims++;
-  for (int i = dims.nbDims; i > 0; i--) {
-    dims.d[i] = dims.d[i-1];
-  }
-  dims.d[0] = -1; //GetMaxBatchSize(); // or should we put -1?
-
-  // TODO(tmorris): should we warn for any dynamic non-batch dims? shapes should
-  // be defined by this point.
+  // TODO(tmorris): should this be GetMaxBatchSize(); or get current batch size
+  const int batch_size = -1;
+  input_dims.insert(input_dims.begin(), batch_size);
 
   // Create weights
   nvinfer1::Dims shape_dims;
   shape_dims.nbDims = 1;
-  shape_dims.d[0] = dims.nbDims;
+  shape_dims.d[0] = input_dims.size();
   TRT_ShapedWeights weights = params->weight_store->GetTempWeights(
       tensorflow::DataType::DT_INT32, shape_dims);
-
   // Set value of weight to shape of input tensor
   int* dst = const_cast<int*>(static_cast<int const*>(weights.GetValues()));
-  for (int i = 0; i < dims.nbDims; i++) {
-    dst[i] = dims.d[i];
-  }
+  std::copy(input_dims.begin(), input_dims.end(), dst);
 
   params->outputs->push_back(TRT_TensorOrWeights(weights));
+  return tensorflow::Status::OK();
+}
+
+tensorflow::Status ConvertSquare(OpConverterParams* params) {
+  const auto& inputs = params->inputs;
+  const auto& node_def = params->node_def;
+  if (inputs.at(0).is_weights()) {
+    return tensorflow::errors::Unimplemented(
+        "Square is only implemented for tensors, at ", node_def.name());
+  }
+
+  // Constant 2
+  nvinfer1::Dims dims = inputs.at(0).GetTrtDims();
+  for (int i = 0; i < dims.nbDims; i++) {
+    dims.d[i] = 1;
+  }
+  TRT_ShapedWeights weights = params->weight_store->GetTempWeights(
+      tensorflow::DataType::DT_FLOAT, dims);
+  auto weights_ptr = static_cast<float*>(const_cast<void*>(
+      weights.GetValues()));
+  weights_ptr[0] = 2.f;
+  nvinfer1::IConstantLayer* const2_layer =
+      params->converter->network()->addConstant(dims, weights.GetTrtWeights());
+  TFTRT_RETURN_ERROR_IF_NULLPTR(const2_layer, node_def.name());
+
+  // ElementWise pow Operation
+  const nvinfer1::ITensor* tensor_l = inputs.at(0).tensor();
+  const nvinfer1::ITensor* tensor_r = const2_layer->getOutput(0);
+  nvinfer1::IElementWiseLayer* layer =
+      params->converter->network()->addElementWise(
+          *const_cast<nvinfer1::ITensor*>(tensor_l),
+          *const_cast<nvinfer1::ITensor*>(tensor_r),
+          nvinfer1::ElementWiseOperation::kPOW);
+  TFTRT_RETURN_ERROR_IF_NULLPTR(layer, node_def.name());
+  nvinfer1::ITensor* output_tensor = layer->getOutput(0);
+
+  params->outputs->push_back(TRT_TensorOrWeights(output_tensor));
   return tensorflow::Status::OK();
 }
 
@@ -3063,9 +3200,9 @@ void Converter::RegisterOpConverters() {
   op_registry_["Squeeze"] = ConvertSqueeze;
   op_registry_["ExpandDims"] = ConvertExpandDims;
   op_registry_["Shape"] = ConvertShape;
-  //op_registry_["StridedSlice"] = StridedSlice;
-  // TODO(tmorris): ConvertPack
-
+  op_registry_["StridedSlice"] = ConvertStridedSlice;
+  op_registry_["Pack"] = ConvertPack;
+  op_registry_["Square"] = ConvertSquare;
   plugin_converter_ = ConvertPlugin;
 }
 
