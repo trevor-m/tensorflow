@@ -120,6 +120,17 @@ inline nvinfer1::Dims TensorShapeToTrtDims(const TensorShapeType& shape,
   return trt_dims;
 }
 
+inline nvinfer1::Dims VectorToTrtDims(const std::vector<int>& shape,
+                                      bool ignore_first_dim = false) {
+  nvinfer1::Dims trt_dims;
+  const int offset = (ignore_first_dim ? 1 : 0);
+  for (int i = offset; i < shape.size(); i++) {
+    trt_dims.d[i - offset] = shape[i];
+  }
+  trt_dims.nbDims = shape.size() - offset;
+  return trt_dims;
+}
+
 void GetOutputProperties(const grappler::GraphProperties& graph_properties,
                          const Node* node, const int out_port,
                          PartialTensorShape* shape,
@@ -426,6 +437,8 @@ class TRT_TensorOrWeights::SimpleITensor : public nvinfer1::ITensor {
 
 #if NV_TENSORRT_MAJOR >= 5
   bool setDynamicRange(float min, float max) override {}
+
+  float getDynamicRange() const override {}
 #endif
 
  private:
@@ -868,8 +881,19 @@ Status Converter::RenameAndMarkOutputTensors(
     TRT_TensorOrWeights tensor_or_weights;
     TF_RETURN_IF_ERROR(GetTensorOrWeights(output.first, &tensor_or_weights));
     if (!tensor_or_weights.is_tensor()) {
-      return errors::InvalidArgument("Output ", output.first,
-                                     " is weights not tensor");
+      LOG(WARNING) << "Output " << output.first << " of segment is weights not tensor";
+      // Make weights into a tensor
+      nvinfer1::IConstantLayer* layer = network()->addConstant(tensor_or_weights.GetTrtDims(), tensor_or_weights.weights().GetTrtWeights());
+      if (layer == nullptr) {
+        // TODO(tmorris): log error
+        return errors::NotFound("couldn't convert weight to tensor: ", output.first);
+      }
+      nvinfer1::ITensor* output_tensor = layer->getOutput(0);
+      //nvinfer1::DataType ttype;
+      //TF_RETURN_IF_ERROR(ConvertDType(tensor_or_weights.weights().type_, &ttype));
+      //output_tensor->setType(ttype);
+      // Replace output with the tensor
+      tensor_or_weights = TRT_TensorOrWeights(output_tensor);
     }
     nvinfer1::ITensor* tensor = tensor_or_weights.tensor();
     if (tensor == nullptr) {
@@ -1738,39 +1762,54 @@ tensorflow::Status ConvertSqueeze(OpConverterParams* params) {
     return tensorflow::errors::InvalidArgument(
         "One input expected for Squeeze, at ", node_def.name());
   }
+  // Get input shape
+  TRT_TensorOrWeights input_tensor = inputs.at(0);
+  const nvinfer1::Dims dims = input_tensor.GetTrtDims();
+  std::vector<int> input_dims(dims.d, dims.d + dims.nbDims);
+  // Add batch dim back temporarily
+  if (input_tensor.is_tensor()) {
+    input_dims.insert(input_dims.begin(), -1);
+  }
+  const int input_rank = input_dims.size();
+  // Mark axes to remove by setting them to 0
   TFAttrs attrs(node_def);
-  if (attrs.count("squeeze_dims") == 0) {
+  auto squeeze_dims = attrs.get<std::vector<int>>("squeeze_dims");
+  if (squeeze_dims.size() == 0) {
     return tensorflow::errors::Unimplemented(
         "Squeeze is only implemented for explicit dims, at ", node_def.name());
   }
-  // Get input shape
-  TRT_TensorOrWeights input_tensor = inputs.at(0);
-  nvinfer1::Dims input_dims = input_tensor.GetTrtDims();
-  // Mark axes to remove by setting them to 0
-  auto squeeze_dims = attrs.get<std::vector<int>>("squeeze_dims");
   for (int axis : squeeze_dims) {
-    if (axis < 0) axis += input_dims.nbDims + 1;
-    // Subtract 1 for batch dim if tensor
-    if (input_tensor.is_tensor()) axis -= 1;
-    // Make sure target dimension is size 1
-    if (input_dims.d[axis] != 1) {
+    // Make sure axis is valid
+    if ((axis < -input_rank) || (axis >= input_rank)) {
       return tensorflow::errors::InvalidArgument(
-          "Cannot squeeze a dimension which isn't size 1, at", node_def.name());
+          "Axis for Squeeze is invalid, must be in the range "
+          "[-rank(input), rank(input)), at ",
+          node_def.name());
     }
-    // Mark dim for removal
-    input_dims.d[axis] = 0;
+    // Make negative axis positive
+    if (axis < 0) axis += input_rank;
+    LOG(INFO) << axis;
+    // Don't squeeze batch dim
+    if (axis == 0) {
+      return tensorflow::errors::Unimplemented(
+          "Cannot squeeze batch dimension, at ", node_def.name());
+    }
+    // Make sure target dimension is size 1
+    if (input_dims[axis] != 1) {
+      return tensorflow::errors::InvalidArgument(
+          "Cannot squeeze a dimension which isn't size 1, at ", node_def.name());
+    }
+    // Mark dim for removal by setting to 0
+    input_dims[axis] = 0;
   }
-
   if (params->validation_only) return Status::OK();
   
-  // Build new shape by only including non-zero sizes
-  nvinfer1::Dims new_dims;
-  new_dims.nbDims = 0;
-  for (int i = 0;  i < input_dims.nbDims; i++) {
-    if (input_dims.d[i] != 0) {
-      new_dims.d[new_dims.nbDims++] = input_dims.d[i];
-    }
-  }
+  // Remove all dims which are equal to 0
+  input_dims.erase(std::remove(input_dims.begin(), input_dims.end(), 0),
+                   input_dims.end());
+  // Convert input_dims vector into nvinfer1::Dims
+  const bool ignore_first_dim = input_tensor.is_tensor();
+  nvinfer1::Dims new_dims = VectorToTrtDims(input_dims, ignore_first_dim);
   // Reshape tensor
   const nvinfer1::ITensor* output_tensor = nullptr;
   TF_RETURN_IF_ERROR(params->converter->PrepareTensorForShape(
@@ -1799,42 +1838,44 @@ tensorflow::Status ConvertExpandDims(OpConverterParams* params) {
         "Two inputs expected for ExpandDims, at ", node_def.name());
   }
   if (!inputs.at(1).is_weights() ) {
-    return tensorflow::errors::Unimplemented(
+    return tensorflow::errors::InvalidArgument(
         "ExpandDims expects weights for axis, at ", node_def.name());
   }
-
   // Get input shape as vector
   TRT_TensorOrWeights input_tensor = inputs.at(0);
   const nvinfer1::Dims dims = input_tensor.GetTrtDims();
   std::vector<int> input_dims(dims.d, dims.d + dims.nbDims);
-  // Get axes as vector
+  // Add batch dim back temporarily
+  if (input_tensor.is_tensor()) {
+    input_dims.insert(input_dims.begin(), -1);
+  }
+  const int input_rank = input_dims.size();
+  // Get axis
   TRT_ShapedWeights weights = inputs.at(1).weights();
   const int* weights_ptr =
       static_cast<int*>(const_cast<void*>(weights.GetValues()));
-  std::vector<int> axes(weights_ptr, weights_ptr + weights.count());
-  // Sort axes descending
-  std::sort(axes.begin(), axes.end(), std::greater<int>()); 
-  // Add new axes to input shape vector
-  for (int axis : axes) {
-    if (axis < 0) axis += input_dims.size() + 1;
-    // Subtract 1 for batch dim if tensor
-    if (input_tensor.is_tensor()) axis -= 1;
-    if (input_tensor.is_tensor() && axis <= 0) {
-      return tensorflow::errors::Unimplemented(
-          "Modifying batch dimension is not supported for ExpandDims, at ",
-          node_def.name());
-    }
-    // Insert dim of size 1
-    input_dims.insert(input_dims.begin()+axis, 1);
+  int axis = weights_ptr[0];
+  // Make sure axis is valid
+  if ((axis < (-input_rank - 1)) || (axis > input_rank)) {
+    return tensorflow::errors::InvalidArgument(
+        "Axis for ExpandDims is invalid, must be in the range "
+        "[-rank(input) - 1, rank(input)], at ",
+        node_def.name());
   }
+  // Make negative axis positive
+  if (axis < 0) axis += input_rank + 1;
+  if (input_tensor.is_tensor() && axis == 0) {
+    return tensorflow::errors::Unimplemented(
+        "Modifying batch dimension is not supported for ExpandDims, at ",
+        node_def.name());
+  }
+  // Insert new dim of size 1
+  input_dims.insert(input_dims.begin()+axis, 1);
   if (params->validation_only) return Status::OK();
 
   // Convert input_dims vector into nvinfer1::Dims
-  nvinfer1::Dims new_dims;
-  new_dims.nbDims = input_dims.size();
-  for(int i = 0; i < input_dims.size(); i++) {
-    new_dims.d[i] = input_dims[i];
-  }
+  const bool ignore_first_dim = input_tensor.is_tensor();
+  nvinfer1::Dims new_dims = VectorToTrtDims(input_dims, ignore_first_dim);
   // Reshape tensor
   const nvinfer1::ITensor* output_tensor = nullptr;
   TF_RETURN_IF_ERROR(params->converter->PrepareTensorForShape(
@@ -1864,7 +1905,7 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
   std::vector<int> input_dims(dims.d, dims.d + dims.nbDims);
   if (inputs.at(0).is_tensor()) {
     // Temporarily add batch dimension so that indexes line up properly.
-    input_dims.insert(input_dims.begin(), -1);
+    input_dims.insert(input_dims.begin(), inputs.at(0).batch_size());
   }
 
   // Begin
@@ -1969,6 +2010,11 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
   // TODO(tmorris): check bounds
   // TODO(tmorris): check for attempted modification of batch dim (for tensors)
   if (inputs.at(0).is_weights()) {
+    if (input_dims.size() != 1) {
+      return tensorflow::errors::Unimplemented(
+        "StridedSlice requires 1-D inputs for weights, at ", 
+        node_def.name());
+    }
     TRT_ShapedWeights weights = inputs.at(0).weights();
     // Build output weights
     nvinfer1::Dims output_dims;
@@ -1978,22 +2024,61 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
       output_dims.d[i] = end[i] - begin[i];
     }
     LOG(INFO) << "Slice weights output dims: " << DebugString(output_dims);
-    TRT_ShapedWeights weights = params->weight_store->GetTempWeights(
+    TRT_ShapedWeights output_weights = params->weight_store->GetTempWeights(
         weights.type_, output_dims);
-    
+    if (weights.type_ == tensorflow::DataType::DT_FLOAT) {
+      const float* src = static_cast<float*>(weights.GetValues());
+      float* dst = 
+          static_cast<float*>(const_cast<void*>(output_weights.GetValues()));
+      SliceConstant<float>(src, begin[0], end[0], dst);
+    } else if (weights.type_ == tensorflow::DataType::DT_HALF) {
+      const Eigen::half* src = static_cast<Eigen::half*>(weights.GetValues());
+      Eigen::half* dst = 
+          static_cast<Eigen::half*>(const_cast<void*>(output_weights.GetValues()));
+      SliceConstant<Eigen::half>(src, begin[0], end[0], dst);
+    } else if (weights.type_ == tensorflow::DataType::DT_INT32) {
+      const int* src = static_cast<int*>(weights.GetValues());
+      int* dst = 
+          static_cast<int*>(const_cast<void*>(output_weights.GetValues()));
+      SliceConstant<int>(src, begin[0], end[0], dst);
+    } else {
+      return tensorflow::errors::Unimplemented(
+          "StridedSlice does not support datatype ",
+          tensorflow::DataTypeString(weights.type_), ", at ", 
+          node_def.name());
+    }
+    params->outputs->push_back(TRT_TensorOrWeights(output_weights));
   }
   else if (inputs.at(0).is_tensor() ) {
-    nvinfer1::ITensor* tensor = inputs.at(0).tensor();
-    // Make sure shape is 4D
-    if (input_dims.size() != 4) {
+    nvinfer1::ITensor* tensor = const_cast<nvinfer1::ITensor*>(inputs.at(0).tensor());
+    if (input_dims.size() > 4) {
       return tensorflow::errors::Unimplemented(
-        "StridedSlice requires NCHW inputs for tensors, at ", 
+        "StridedSlice is not implemented for tensors with rank > 4, at ", 
         node_def.name());
     }
-    // Find the dimensions which need to be padded
+    // Reshape if necessary to 4-D
+    const bool need_reshape = (input_dims.size() != 4);
+    LOG(INFO) << "need reshape: " << need_reshape;
+    int reshape_dims_added = 0;
+    if (need_reshape) {
+      // Add new dims until tensor is 4D
+      while (input_dims.size() < 4) {
+        input_dims.insert(input_dims.begin()+1, 1);
+        begin.insert(begin.begin()+1, 0);
+        end.insert(end.begin()+1, 1);
+        reshape_dims_added++;
+      }
+      LOG(INFO) << "StridedSlice: need reshape add " << reshape_dims_added;
+      nvinfer1::Dims new_dims = VectorToTrtDims(input_dims, /*ignore_first_dim=*/true);
+      LOG(INFO) << "StridedSlice: Reshape to (batch not included): " << DebugString(new_dims);
+      const nvinfer1::ITensor* output_tensor = nullptr;
+      TF_RETURN_IF_ERROR(params->converter->PrepareTensorForShape(inputs.at(0), new_dims, &output_tensor));
+      tensor = const_cast<nvinfer1::ITensor*>(output_tensor);
+    }
+    // Find the dimensions which need to be modified
     std::vector<int> pad_dims;
     for (int i = 1; i < begin.size(); i++) {
-      if (begin[i] != 0 || (end[2] - input_dims[2]) != 0) {
+      if (begin[i] != 0 || (end[i] - input_dims[i]) != 0) {
         pad_dims.push_back(i);
       }
     }
@@ -2001,10 +2086,18 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
        params->outputs->push_back(inputs.at(0));
       return tensorflow::Status::OK();
     } else if (pad_dims.size() == 1) {
-      // TODO(tmorris): add second dim here with values of 0
-      return tensorflow::errors::Unimplemented(
-        "StridedSlice can only modify 2 dimensions, at ", 
-        node_def.name());
+      // Only one dim is modified but we have to have 2, add a second dim.
+      if (pad_dims[0] == 1) {
+        pad_dims.push_back(2);
+      } else if (pad_dims[0] == 2) {
+        pad_dims.push_back(3);
+      } else if (pad_dims[0] == 3) {
+        pad_dims.push_back(2);
+      } else {
+        return tensorflow::errors::Unimplemented(
+            "StridedSlice can't modify batch dim, at ", 
+            node_def.name());
+      }
     } else if (pad_dims.size() > 2) {
       return tensorflow::errors::Unimplemented(
         "StridedSlice can only modify 2 dimensions, at ", 
@@ -2013,24 +2106,75 @@ tensorflow::Status ConvertStridedSlice(OpConverterParams* params) {
     std::sort(pad_dims.begin(), pad_dims.end());
     // Convert to pre/post padding values
     nvinfer1::DimsHW pre_padding, post_padding;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < pad_dims.size(); i++) {
       const int axis = pad_dims[i];
       pre_padding.d[i] = -begin[axis];
       post_padding.d[i] = end[axis] - input_dims[axis];
     }
+    // IPaddingLayer will always apply the padding to dims 2,3 (input format is NCHW)
+    // TODO(tmorris): how does TRT know the data format - can we query it here??
     // Transpose if necessary to NCHW
-
+    const bool need_transpose = !(pad_dims[0] == 2 && pad_dims[1] == 3);
+    std::vector<int> inv_transpose_order(input_dims.size());
+    if (need_transpose) {
+      std::vector<int> transpose_order(input_dims.size());
+      if (pad_dims[0] == 1 && pad_dims[1] == 3) {
+        transpose_order = {0, 2, 1, 3};
+        inv_transpose_order = {0, 2, 1, 3};
+      } else if (pad_dims[0] == 1 && pad_dims[1] == 2) {
+        transpose_order = {0, 3, 1, 2};
+        inv_transpose_order = {0, 2, 3, 1};
+      }
+      const nvinfer1::ITensor* output_tensor = nullptr;
+      TF_RETURN_IF_ERROR(params->converter->TransposeTensor(tensor, transpose_order, &output_tensor));
+      tensor = const_cast<nvinfer1::ITensor*>(output_tensor);
+      LOG(INFO) << "transpose to: " << transpose_order[0] << ", " << transpose_order[1] << ", " << transpose_order[2] << ", " << transpose_order[3];
+    }
     LOG(INFO) << "input_dims: " << DebugString(dims);
     LOG(INFO) << "pre_padding: " << DebugString(pre_padding);
     LOG(INFO) << "post_padding: " << DebugString(post_padding);
-    //LOG(INFO) << "data_format: " << attrs.get<string>("data_format");
 
+    // Add padding layer
     nvinfer1::IPaddingLayer* layer = params->converter->network()->addPadding(
         *const_cast<nvinfer1::ITensor*>(tensor), pre_padding, post_padding);
     TFTRT_RETURN_ERROR_IF_NULLPTR(layer, node_def.name());
-    const nvinfer1::ITensor* output_tensor = layer->getOutput(0);
+    tensor = layer->getOutput(0);
+
+    // Restore transpose
+    if (need_transpose) {
+      const nvinfer1::ITensor* output_tensor = nullptr;
+      TF_RETURN_IF_ERROR(params->converter->TransposeTensor(tensor, inv_transpose_order, &output_tensor));
+      tensor = const_cast<nvinfer1::ITensor*>(output_tensor);
+      LOG(INFO) << "transpose to: " << inv_transpose_order[0] << ", " << inv_transpose_order[1] << ", " << inv_transpose_order[2] << ", " << inv_transpose_order[3];
+    }
+
+    // Restore reshape
+    if (need_reshape) {
+      // Calculate output dimensions
+      for(int i = 0; i < pad_dims.size(); i++) {
+        const int axis = pad_dims[i];
+        input_dims[axis] = end[axis] - begin[axis];
+      }
+      // Remove added 1 dimensions
+      for (int i = 0; i < reshape_dims_added; i++) {
+        int value = input_dims[1];
+        if (value != 1) {
+          return tensorflow::errors::Unimplemented(
+              "StridedSlice error when reshaping, at ", 
+              node_def.name());
+        }
+        input_dims.erase(input_dims.begin()+1);
+      }
+
+      nvinfer1::Dims new_dims = VectorToTrtDims(input_dims, /*ignore_first_dim=*/true);
+      LOG(INFO) << "StridedSlice: Reshape back to (batch not included): " << DebugString(new_dims);
+      const nvinfer1::ITensor* output_tensor = nullptr;
+      TF_RETURN_IF_ERROR(params->converter->PrepareTensorForShape(TRT_TensorOrWeights(tensor), new_dims, &output_tensor));
+      tensor = const_cast<nvinfer1::ITensor*>(output_tensor);
+    }
+
     params->outputs->push_back(
-        TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(output_tensor)));
+        TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(tensor)));
   }
   return tensorflow::Status::OK();
 }
@@ -2065,9 +2209,7 @@ tensorflow::Status ConvertPack(OpConverterParams* params) {
   }
 
   // Build weight to store output
-  nvinfer1::Dims dims;
-  dims.nbDims = 1;
-  dims.d[0] = output.size();
+  nvinfer1::Dims dims = VectorToTrtDims({(int)output.size()});
   TRT_ShapedWeights weights = params->weight_store->GetTempWeights(
       tensorflow::DataType::DT_INT32, dims);
   // Set value of weight to shape of input tensor
@@ -2088,21 +2230,29 @@ tensorflow::Status ConvertShape(OpConverterParams* params) {
 
   nvinfer1::Dims dims = inputs.at(0).GetTrtDims();
   std::vector<int> input_dims(dims.d, dims.d + dims.nbDims);
+  // Warn about undefined shapes
+  if (!HasStaticShape(dims)) {
+    // Should this be an error instead?
+    LOG(WARNING) << "Input to Shape has an undefined shape. Please try "
+                 << "converting with \"is_dynamic_op=True\", at "
+                 << node_def.name();
+  }
   // Shape op will expect batch at dim 0, so we need to add it back
-  // TODO(tmorris): should this be GetMaxBatchSize(); or get current batch size
-  const int batch_size = -1;
-  input_dims.insert(input_dims.begin(), batch_size);
-
-  // Create weights
-  nvinfer1::Dims shape_dims;
-  shape_dims.nbDims = 1;
-  shape_dims.d[0] = input_dims.size();
+  if (inputs.at(0).is_tensor()) {
+    const int batch_size = inputs.at(0).batch_size();
+    input_dims.insert(input_dims.begin(), batch_size);
+  }
+  // Create weights for output
+  nvinfer1::Dims shape_dims = VectorToTrtDims({(int)input_dims.size()});;
   TRT_ShapedWeights weights = params->weight_store->GetTempWeights(
       tensorflow::DataType::DT_INT32, shape_dims);
-  // Set value of weight to shape of input tensor
+  // Set value of weight to shape of input
   int* dst = const_cast<int*>(static_cast<int const*>(weights.GetValues()));
   std::copy(input_dims.begin(), input_dims.end(), dst);
 
+  LOG(INFO) << "ConvertShape:" << node_def.name() << ": ";
+  for (int i = 0; i < weights.count(); i++)
+    LOG(INFO) << dst[i];
   params->outputs->push_back(TRT_TensorOrWeights(weights));
   return tensorflow::Status::OK();
 }
@@ -3172,8 +3322,8 @@ void TrtNodeValidator::RegisterOpValidators() {
   op_validators_["Transpose"] = ConvertTranspose;
   op_validators_["Reshape"] = ConvertReshape;
   op_validators_["MatMul"] = ConvertMatMul;
-  // op_validators_["Squeeze"] = ConvertSqueeze;
-  // op_validators_["ExpandDims"] = ConvertExpandDims;
+  op_validators_["Squeeze"] = ConvertSqueeze;
+  op_validators_["ExpandDims"] = ConvertExpandDims;
   // op_validators_["StridedSlice"] = StridedSlice;
 }
 

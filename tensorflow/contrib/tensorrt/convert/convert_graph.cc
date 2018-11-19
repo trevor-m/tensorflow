@@ -571,6 +571,12 @@ tensorflow::Status CreateTRTNode(const std::vector<EngineInfo>& infos, int pos,
       }
     }
   }
+  // Make sure the segment has at least 1 input
+  // TODO(tmorris): we could relax this constraint but there are issues
+  if (inputs.size() == 0) {
+    return tensorflow::errors::Unimplemented("Segments with no inputs are not supported yet, falling back to native TF.");
+  }
+
   string segment_string;
   if (info.engine_type == EngineInfo::EngineType::TRTStatic ||
       info.precision_mode == INT8MODE) {
