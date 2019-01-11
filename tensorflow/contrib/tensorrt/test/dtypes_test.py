@@ -31,6 +31,52 @@ from tensorflow.python.ops import nn
 from tensorflow.python.platform import test
 
 
+class Float16Test(trt_test.TfTrtIntegrationTestBase):
+
+  def GetParams(self):
+    """Test fp16 inputs and outputs to TF-TRT"""
+    input_name = 'input'
+    output_name = 'output'
+    input_dims = [100, 4]
+    dtype = dtypes.float16
+    g = ops.Graph()
+    with g.as_default():
+      x = array_ops.placeholder(
+          dtype=dtype, shape=input_dims, name=input_name)
+      b = constant_op.constant(np.random.randn(4, 10), dtype=dtype, name='Kernel')
+      x = math_ops.matmul(x, b, name='MatMul')
+      b = constant_op.constant(np.random.randn(10), dtype=dtype, name='Bias')
+      x = nn.bias_add(x, b, name='BiasAdd')
+      x = array_ops.identity(x, name=output_name)
+    return trt_test.TfTrtIntegrationTestParams(
+        gdef=g.as_graph_def(),
+        input_names=[input_name],
+        input_dims=[input_dims],
+        output_names=[output_name],
+        expected_output_dims=[(100, 10)])
+
+  def GetConversionParams(self, run_params):
+    """Return a ConversionParams for test."""
+    conversion_params = super(Float16Test,
+                              self).GetConversionParams(run_params)
+    return conversion_params._replace(
+        max_batch_size=100,
+        maximum_cached_engines=1,
+        # Disable layout optimizer, since it will convert BiasAdd with NHWC
+        # format to NCHW format under four dimentional input.
+        rewriter_config=trt_test.OptimizerDisabledRewriterConfig())
+
+  def ExpectedEnginesToBuild(self, run_params):
+    """Return the expected engines to build."""
+    return {'TRTEngineOp_0' : ['Kernel', 'MatMul', 'Bias', 'BiasAdd']}
+
+  def ShouldRunTest(self, run_params):
+    """Whether to run the test."""
+    # TODO(aaroey): Trt 4.0 forbids conversion for tensors with rank <3 in int8
+    # mode, which is a bug. Re-enable this when trt library is fixed.
+    return run_params.precision_mode == "FP16"
+
+
 class ExcludeUnsupportedInt32Test(trt_test.TfTrtIntegrationTestBase):
 
   def _ConstOp(self, shape, dtype):

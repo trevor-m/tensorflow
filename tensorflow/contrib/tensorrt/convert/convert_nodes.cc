@@ -929,17 +929,22 @@ Status Converter::AddInputTensor(const string& name, nvinfer1::DataType dtype,
 }
 
 Status Converter::RenameAndMarkOutputTensors(
-    const std::vector<std::pair<string, string>>& output_tensors) {
+    const std::vector<std::tuple<string, string, nvinfer1::DataType>>& output_tensors) {
   for (const auto& output : output_tensors) {
+    string source_name;
+    string dest_name;
+    nvinfer1::DataType trt_dtype;
+    std::tie(source_name, dest_name, trt_dtype) = output;
+
     TRT_TensorOrWeights tensor_or_weights;
-    TF_RETURN_IF_ERROR(GetTensorOrWeights(output.first, &tensor_or_weights));
+    TF_RETURN_IF_ERROR(GetTensorOrWeights(source_name, &tensor_or_weights));
     if (!tensor_or_weights.is_tensor()) {
-      return errors::InvalidArgument("Output ", output.first,
+      return errors::InvalidArgument("Output ", source_name,
                                      " is weights not tensor");
     }
     nvinfer1::ITensor* tensor = tensor_or_weights.tensor();
     if (tensor == nullptr) {
-      return errors::NotFound("Output tensor not found: ", output.first);
+      return errors::NotFound("Output tensor not found: ", source_name);
     }
     // Check if this tensor has already been marked as an output.
     // ConvertIdentity can cause the same tensor to be repeated in
@@ -957,10 +962,13 @@ Status Converter::RenameAndMarkOutputTensors(
       MarkQuantizationRangesAsInferrable(tensor, layer->getOutput(0));
       tensor = layer->getOutput(0);
     }
-    tensor->setName(output.second.c_str());
-    VLOG(1) << "Marking output tensor " << output.first << ", as output tensor "
-            << output.second;
+    tensor->setName(dest_name.c_str());
+    VLOG(1) << "Marking output tensor " << source_name << ", as output tensor "
+            << dest_name;
     network()->markOutput(*tensor);
+    // Set type after marking as output so TRT doesn't log a warning (TRT only
+    // supports setType for outputs of engine).
+    tensor->setType(trt_dtype);
   }
   return Status::OK();
 }
@@ -2787,8 +2795,9 @@ tensorflow::Status ConvertConst(OpConverterParams* params) {
         converted_dtype, tensor, tensor_proto.int_val().begin(),
         tensor_proto.int_val_size(), params->weight_store, &weights));
   } else if (!tensor_proto.half_val().empty()) {
-    // TODO(aaroey): implement fp16 conversion.
-    return errors::Unimplemented("fp16 constant is not supported yet.");
+    TF_RETURN_IF_ERROR(TfTensorToTrtWeights(
+        converted_dtype, tensor, tensor_proto.half_val().begin(),
+        tensor_proto.half_val_size(), params->weight_store, &weights));
   } else if (!tensor_proto.tensor_content().empty()) {
     // TODO(aaroey): fp16 will remain in half format and is not converted to
     // fp32, but the converter currently uses all float weights as fp32. Fix
@@ -3606,9 +3615,6 @@ tensorflow::Status ConvertTopK(OpConverterParams* params) {
 
   nvinfer1::ITensor* output_value_tensor = layer->getOutput(0);
   nvinfer1::ITensor* output_indices_tensor = layer->getOutput(1);
-  // Tensor type for network output is not inferred. Indices should be INT32
-  // (default is float).
-  output_indices_tensor->setType(nvinfer1::DataType::kINT32);
   params->outputs->push_back(TRT_TensorOrWeights(output_value_tensor));
   params->outputs->push_back(TRT_TensorOrWeights(output_indices_tensor));
   return tensorflow::Status::OK();
@@ -3721,7 +3727,8 @@ tensorflow::Status ConvertGraphDefToEngine(
   // Build the network
   VLOG(1) << "Starting engine conversion ";
   Converter converter(trt_network.get(), precision_mode, use_calibration);
-  std::vector<std::pair<string, string>> output_tensors;
+  // Tuple of {Input name, Node name, Type}
+  std::vector<std::tuple<string, string, nvinfer1::DataType>> output_tensors;
   // Graph nodes are already topologically sorted during construction
   for (const auto& node_def : gdef.node()) {
     string node_name = node_def.name();
@@ -3766,7 +3773,13 @@ tensorflow::Status ConvertGraphDefToEngine(
       if (output_tensors.size() <= slot_number) {
         output_tensors.resize(slot_number + 1);
       }
-      output_tensors.at(slot_number) = {node_def.input(0), node_name};
+      // Get output type that TensorFlow expects
+      TFAttrs attrs(node_def);
+      tensorflow::DataType tf_dtype = attrs.get<tensorflow::DataType>("T");
+      nvinfer1::DataType trt_dtype;
+      TF_RETURN_IF_ERROR(ConvertDType(tf_dtype, &trt_dtype));
+      // Add output
+      output_tensors.at(slot_number) = std::make_tuple(node_def.input(0), node_name, trt_dtype);
     } else {
       VLOG(2) << "Converting node: " << node_def.name() << " , "
               << node_def.op();
