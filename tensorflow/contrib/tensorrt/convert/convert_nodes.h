@@ -417,7 +417,8 @@ class Converter {
   // standard TF tensor names, i.e. node names followed by output slot number
   // (or just the node name if the tensor is the first output of the node).
   Status RenameAndMarkOutputTensors(
-      const std::vector<std::pair<string, string>>& output_tensors);
+      const std::vector<std::tuple<string, string, nvinfer1::DataType>>&
+          output_tensors);
 
   //////////////////////////////////////////////////////////////////////////////
   // Methods used by op converters to convert individual TF node and add layers
