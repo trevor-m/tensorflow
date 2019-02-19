@@ -1009,15 +1009,23 @@ Status Converter::AddInputTensor(const string& name, nvinfer1::DataType dtype,
   // op converter to ensure the batch size of the outputs is not changed.
   // TODO(laigd): we need to test this properties.
   Status status = MaybeUpdateBatchSize(batch_size);
+  bool broadcast_along_batch = false;
   if (!status.ok()) {
-    return Status(status.code(), StrCat("Batch size doesn't match for tensor ",
+    // If the batch size of the input is 1, we allow a broadcast over the batch
+    // dimension.
+    if (batch_size == 1) {
+      broadcast_along_batch = true;
+    } else {
+      return Status(status.code(), StrCat("Batch size doesn't match for tensor ",
                                         name, ": ", status.error_message()));
+    }
   }
   nvinfer1::ITensor* tensor = network()->addInput(name.c_str(), dtype, dims);
   if (tensor == nullptr) {
     return errors::InvalidArgument("Failed to create Input layer tensor ", name,
                                    " rank=", dims.nbDims);
   }
+  tensor->setBroadcastAcrossBatch(broadcast_along_batch);
   status = AddTensorOrWeights(name, TRT_TensorOrWeights(tensor));
   if (!status.ok()) {
     return Status(status.code(), StrCat("Failed to add input tensor ", name,

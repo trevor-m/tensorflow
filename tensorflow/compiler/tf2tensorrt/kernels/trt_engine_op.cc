@@ -406,9 +406,11 @@ bool TRTEngineOp::ExecuteTrtEngine(OpKernelContext* ctx,
     const Tensor& input_tensor = ctx->input(i);
     const TensorShape& input_shape = input_tensor.shape();
     if (num_batch != input_shape.dim_size(0)) {
-      LOG(ERROR) << "Input data has inconsistent batch size: " << num_batch
+      // TODO(tmorris): check that this tensor is broadcasted along batch dim
+      // first
+      LOG(WARNING) << "Input data has inconsistent batch size: " << num_batch
                  << " vs " << input_shape.dim_size(0);
-      return kRetry;
+      // return kRetry;
     }
     auto dtype = cuda_engine->getBindingDataType(binding_index);
     switch (dtype) {
