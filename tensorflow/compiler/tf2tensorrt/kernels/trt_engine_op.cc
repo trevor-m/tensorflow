@@ -391,7 +391,7 @@ bool TRTEngineOp::ExecuteTrtEngine(OpKernelContext* ctx,
   auto& cuda_engine = engine_context->cuda_engine;
   const bool kRetry = true;
   // All inputs must have the same batch size, unless their batch size is 1.
-  // Find first non-1 batch size to use as the batch size;
+  // Choose first non-1 size as the batch size
   int num_batch = 1;
   for (int i = 0; i < ctx->num_inputs(); ++i) {
     if (ctx->input(0).shape().dim_size(0) != 1) {
@@ -412,7 +412,7 @@ bool TRTEngineOp::ExecuteTrtEngine(OpKernelContext* ctx,
     const Tensor& input_tensor = ctx->input(i);
     const TensorShape& input_shape = input_tensor.shape();
     // Batch size of 1 is allowed even if it doesnt match the rest of the inputs
-    // because we broadcast those tensors across batch.
+    // because we broadcast those tensors across the batch dimension.
     if (num_batch != input_shape.dim_size(0) && input_shape.dim_size(0) != 1) {
       LOG(ERROR) << "Input data has inconsistent batch size: " << num_batch
                  << " vs " << input_shape.dim_size(0);

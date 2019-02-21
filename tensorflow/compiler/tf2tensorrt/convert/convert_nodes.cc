@@ -1011,8 +1011,8 @@ Status Converter::AddInputTensor(const string& name, nvinfer1::DataType dtype,
   Status status = MaybeUpdateBatchSize(batch_size);
   bool broadcast_along_batch = false;
   if (!status.ok()) {
-    // If the batch size of the input is 1, we allow a broadcast over the batch
-    // dimension.
+    // If the batch size of the input differs from the rest but is 1, we allow a
+    // broadcast over the batch dimension.
     if (batch_size == 1) {
       broadcast_along_batch = true;
     } else {
