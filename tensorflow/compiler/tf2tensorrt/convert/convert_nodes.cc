@@ -1016,8 +1016,9 @@ Status Converter::AddInputTensor(const string& name, nvinfer1::DataType dtype,
     if (batch_size == 1) {
       broadcast_along_batch = true;
     } else {
-      return Status(status.code(), StrCat("Batch size doesn't match for tensor ",
-                                        name, ": ", status.error_message()));
+      return Status(status.code(),
+                    StrCat("Batch size doesn't match for tensor ", name, ": ",
+                           status.error_message()));
     }
   }
   nvinfer1::ITensor* tensor = network()->addInput(name.c_str(), dtype, dims);
