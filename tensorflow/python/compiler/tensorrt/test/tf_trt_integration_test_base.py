@@ -173,10 +173,13 @@ class TfTrtIntegrationTestBase(test_util.TensorFlowTestCase):
     batch_list = []
     for dims_list in self._GetParamsCached().input_dims:
       assert dims_list
-      # Each list of shapes should have same batch size.
-      input_batches = [dims[0] for dims in dims_list]
-      assert max(input_batches) == min(input_batches)
-      batch_list.append(input_batches[0])
+      # Each list of shapes should have same batch size, unless the input has a
+      # batch size of 1.
+      unique_batch_sizes = sorted(list(set([dims[0] for dims in dims_list])))
+      assert len(unique_batch_sizes) in [1, 2]
+      if len(unique_batch_sizes) == 2:
+        assert unique_batch_sizes[0] == 1
+      batch_list.append(unique_batch_sizes[-1])
     return ConversionParams(
         # We use the minimum of all the batch sizes, so when multiple different
         # input shapes are provided it'll always create new engines in the
