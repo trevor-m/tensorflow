@@ -390,9 +390,15 @@ bool TRTEngineOp::ExecuteTrtEngine(OpKernelContext* ctx,
   VLOG(1) << "Executing TRT engine: " << name();
   auto& cuda_engine = engine_context->cuda_engine;
   const bool kRetry = true;
-  // All inputs must have the same batch size, so just get it from the first
-  // input.
-  const int num_batch = ctx->input(0).shape().dim_size(0);
+  // All inputs must have the same batch size, unless their batch size is 1.
+  // Find first non-1 batch size to use as the batch size;
+  int num_batch = 1;
+  for (int i = 0; i < ctx->num_inputs(); ++i) {
+    if (ctx->input(0).shape().dim_size(0) != 1) {
+      num_batch = ctx->input(0).shape().dim_size(0);
+      break;
+    }
+  }
   const int num_binding = ctx->num_inputs() + ctx->num_outputs();
   std::vector<void*> buffers(num_binding);
   for (int i = 0; i < ctx->num_inputs(); i++) {
@@ -405,12 +411,12 @@ bool TRTEngineOp::ExecuteTrtEngine(OpKernelContext* ctx,
 
     const Tensor& input_tensor = ctx->input(i);
     const TensorShape& input_shape = input_tensor.shape();
-    if (num_batch != input_shape.dim_size(0)) {
-      // TODO(tmorris): check that this tensor is broadcasted along batch dim
-      // first
-      LOG(WARNING) << "Input data has inconsistent batch size: " << num_batch
+    // Batch size of 1 is allowed even if it doesnt match the rest of the inputs
+    // because we broadcast those tensors across batch.
+    if (num_batch != input_shape.dim_size(0) && input_shape.dim_size(0) != 1) {
+      LOG(ERROR) << "Input data has inconsistent batch size: " << num_batch
                  << " vs " << input_shape.dim_size(0);
-      // return kRetry;
+      return kRetry;
     }
     auto dtype = cuda_engine->getBindingDataType(binding_index);
     switch (dtype) {
