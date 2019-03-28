@@ -911,7 +911,7 @@ def _find_libs(repository_ctx, cuda_config):
             repository_ctx,
             cpu_value,
             cuda_config.cuda_toolkit_path,
-            cuda_config.cuda_version,
+            cuda_config.cuda_lib_version,
         ),
     }
 
